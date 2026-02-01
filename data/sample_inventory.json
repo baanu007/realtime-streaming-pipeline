@@ -1,0 +1,12 @@
+[
+  {"product_id": "PROD-101", "warehouse_id": "WH-001", "quantity_change": -2, "event_type": "SALE", "event_time": "2024-01-15T10:23:45Z"},
+  {"product_id": "PROD-102", "warehouse_id": "WH-001", "quantity_change": -1, "event_type": "SALE", "event_time": "2024-01-15T10:24:12Z"},
+  {"product_id": "PROD-103", "warehouse_id": "WH-002", "quantity_change": -3, "event_type": "SALE", "event_time": "2024-01-15T10:25:33Z"},
+  {"product_id": "PROD-101", "warehouse_id": "WH-001", "quantity_change": 50, "event_type": "RESTOCK", "event_time": "2024-01-15T08:00:00Z"},
+  {"product_id": "PROD-104", "warehouse_id": "WH-001", "quantity_change": -1, "event_type": "SALE", "event_time": "2024-01-15T10:26:45Z"},
+  {"product_id": "PROD-105", "warehouse_id": "WH-002", "quantity_change": -2, "event_type": "SALE", "event_time": "2024-01-15T10:27:18Z"},
+  {"product_id": "PROD-102", "warehouse_id": "WH-001", "quantity_change": 25, "event_type": "RESTOCK", "event_time": "2024-01-15T09:00:00Z"},
+  {"product_id": "PROD-106", "warehouse_id": "WH-003", "quantity_change": -4, "event_type": "SALE", "event_time": "2024-01-15T10:28:55Z"},
+  {"product_id": "PROD-107", "warehouse_id": "WH-001", "quantity_change": -1, "event_type": "SALE", "event_time": "2024-01-15T10:30:22Z"},
+  {"product_id": "PROD-103", "warehouse_id": "WH-002", "quantity_change": 100, "event_type": "RESTOCK", "event_time": "2024-01-15T07:30:00Z"}
+]

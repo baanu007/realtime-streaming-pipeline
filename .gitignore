@@ -17,9 +17,9 @@ derby.log
 # OS
 .DS_Store
 
-# Data
-data/*.csv
-data/*.json
+# Data (keep sample files)
+# data/*.csv
+# data/*.json
 
 # Checkpoints
 checkpoints/
