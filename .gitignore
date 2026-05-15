@@ -1,25 +1,41 @@
-# Python
+# Byte-compiled / build artefacts
 __pycache__/
 *.py[cod]
-venv/
-.env
+*.egg-info/
+build/
+dist/
+.eggs/
+.cache/
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
 
-# Spark
-*.jar
-metastore_db/
-spark-warehouse/
-derby.log
+# Virtualenvs
+.venv/
+venv/
+env/
 
 # IDE
 .idea/
 .vscode/
+*.swp
 
 # OS
 .DS_Store
+Thumbs.db
 
-# Data (keep sample files)
-# data/*.csv
-# data/*.json
+# Terraform
+infrastructure/terraform/.terraform/
+infrastructure/terraform/.terraform.lock.hcl
+infrastructure/terraform/*.tfstate
+infrastructure/terraform/*.tfstate.*
+infrastructure/terraform/*.tfvars
+infrastructure/terraform/*.tfvars.json
 
-# Checkpoints
-checkpoints/
+# Local secrets / env
+.env
+.env.*
+
+# Lambda build packages
+build/*.zip

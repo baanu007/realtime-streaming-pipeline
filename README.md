@@ -1,244 +1,184 @@
-# ⚡ Real-Time Streaming Pipeline
+# ⚡ Realtime Streaming Pipeline
 
-A production-grade streaming data pipeline using **Apache Kafka**, **PySpark Structured Streaming**, and **AWS** for real-time inventory and order processing.
+End-to-end streaming pipeline that lands clickstream / order / signup events
+in Snowflake within minutes of being generated:
 
-![Apache Kafka](https://img.shields.io/badge/Apache%20Kafka-231F20?style=for-the-badge&logo=apache-kafka&logoColor=white)
-![Apache Spark](https://img.shields.io/badge/Apache%20Spark-E25A1C?style=for-the-badge&logo=apache-spark&logoColor=white)
+**Producer → Kinesis Data Stream → Lambda (enrich + route) → Firehose → S3 → Snowpipe → Snowflake (Streams + Tasks)**
+
 ![AWS](https://img.shields.io/badge/AWS-232F3E?style=for-the-badge&logo=amazon-aws&logoColor=white)
+![Snowflake](https://img.shields.io/badge/Snowflake-29B5E8?style=for-the-badge&logo=snowflake&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![Terraform](https://img.shields.io/badge/Terraform-7B42BC?style=for-the-badge&logo=terraform&logoColor=white)
 
-## 📋 Overview
+---
 
-This project implements a real-time streaming pipeline that processes e-commerce events (orders, inventory updates, user activity) with sub-second latency. Key features:
+## What this project actually does
 
-- **Event-Driven Architecture**: Kafka as the central nervous system
-- **Real-Time Processing**: Spark Structured Streaming with exactly-once semantics
-- **Change Data Capture (CDC)**: Capture and process database changes in real-time
-- **Multi-Sink Output**: Write to data warehouse, cache, and alerting systems
-- **Auto-Scaling**: Kubernetes-ready deployment
+1. A configurable Python **event simulator** publishes synthetic events to
+   Amazon **Kinesis Data Streams** using `PutRecords` batching with
+   `user_id`-based partition keys.
+2. A **Kinesis-triggered Lambda** (`stream_processor`) decodes records,
+   enriches them with user metadata from DynamoDB, and routes them to:
+   - **Firehose** for batched delivery to S3 (Parquet, dynamic partitioning).
+   - **SNS** for high-value-order / fraud alerts.
+3. **Snowpipe** auto-ingests every Firehose object into `RAW.RAW_EVENTS`
+   (VARIANT landing table) using S3 event notifications via SNS.
+4. A Snowflake **Stream** + 1-minute **Task** merges new rows into the typed,
+   clustered `CURATED.EVENTS` table.
+5. A separate **DLQ Lambda** archives any poison-pill records to a dead-letter
+   S3 bucket, partitioned by `dt`/`hh`.
+6. A **`HANDLE_LATE_EVENTS`** stored procedure reconciles late-arriving data
+   by re-merging from the external table over the same S3 prefix.
 
-## 🏗️ Architecture
+The full text-art architecture lives in [`docs/architecture.md`](docs/architecture.md).
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              DATA SOURCES                                    │
-├─────────────────┬─────────────────┬─────────────────┬───────────────────────┤
-│   E-Commerce    │   POS System    │    Warehouse    │      Mobile App       │
-│      API        │    (CDC)        │    Scanners     │       Events          │
-└────────┬────────┴────────┬────────┴────────┬────────┴───────────┬───────────┘
-         │                 │                 │                    │
-         ▼                 ▼                 ▼                    ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           KAFKA CLUSTER                                      │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐        │
-│  │orders-topic │  │inventory-   │  │user-events  │  │cdc-changes  │        │
-│  │             │  │updates      │  │             │  │             │        │
-│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘        │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    SPARK STRUCTURED STREAMING                                │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │                        Stream Processing Jobs                         │   │
-│  │  • Order Enrichment (join with customer/product data)                │   │
-│  │  • Inventory Aggregation (real-time stock levels)                    │   │
-│  │  • Fraud Detection (ML scoring in real-time)                         │   │
-│  │  • Session Analytics (user behavior windows)                         │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                    ┌─────────────────┼─────────────────┐
-                    ▼                 ▼                 ▼
-┌─────────────────────────┐ ┌─────────────────┐ ┌─────────────────────────┐
-│      DATA WAREHOUSE     │ │    REDIS CACHE   │ │    ALERTING SYSTEM      │
-│      (Snowflake)        │ │  (Real-time KV)  │ │   (SNS/PagerDuty)       │
-│  • Fact tables          │ │  • Stock levels  │ │  • Low stock alerts     │
-│  • Aggregated metrics   │ │  • Order status  │ │  • Fraud alerts         │
-│  • Historical data      │ │  • Session data  │ │  • SLA breaches         │
-└─────────────────────────┘ └─────────────────┘ └─────────────────────────┘
-```
+---
 
-## 📁 Project Structure
+## Repository layout
 
 ```
 realtime-streaming-pipeline/
 ├── src/
-│   ├── producers/              # Kafka producers
-│   │   ├── order_producer.py
-│   │   ├── inventory_producer.py
-│   │   └── cdc_producer.py
-│   ├── consumers/              # Spark streaming jobs
-│   │   ├── order_processor.py
-│   │   ├── inventory_aggregator.py
-│   │   ├── fraud_detector.py
-│   │   └── session_analyzer.py
-│   ├── schemas/                # Avro/JSON schemas
-│   │   ├── order_schema.avsc
-│   │   └── inventory_schema.avsc
-│   └── utils/
-│       ├── kafka_utils.py
-│       ├── spark_utils.py
-│       └── config.py
+│   ├── producers/
+│   │   ├── synthetic_data.py        # Faker-based event generator
+│   │   └── event_simulator.py       # Kinesis PutRecords driver
+│   ├── lambdas/
+│   │   ├── stream_processor/        # Kinesis → enrich → Firehose/SNS
+│   │   └── dlq_processor/           # SQS DLQ → S3 dead-letter archive
+│   └── common/
+│       └── kinesis_utils.py         # Kinesis record decoding
 ├── infrastructure/
-│   ├── docker-compose.yml      # Local Kafka cluster
-│   ├── kubernetes/             # K8s manifests
-│   └── terraform/              # AWS infrastructure
+│   ├── firehose/
+│   │   └── firehose_config.json     # Reference Firehose config
+│   └── terraform/
+│       ├── main.tf, variables.tf, outputs.tf
+│       └── modules/
+│           ├── kinesis_stream/
+│           ├── firehose/
+│           ├── lambda_consumer/
+│           └── sns_topic/
+├── snowflake/
+│   ├── ddl/
+│   │   ├── raw_events_table.sql
+│   │   ├── staging_external_table.sql
+│   │   ├── snowpipe.sql
+│   │   ├── streams_tasks.sql
+│   │   └── curated_events.sql
+│   └── procedures/
+│       └── handle_late_events.sql
 ├── tests/
-│   ├── unit/
-│   └── integration/
-├── data/                       # Sample data for testing
-├── config/
-│   └── application.yaml
+│   ├── test_event_simulator.py
+│   ├── test_stream_processor.py
+│   ├── test_dlq_processor.py
+│   └── conftest.py
+├── data/                            # Small sample payloads
+├── docs/architecture.md
+├── screenshots/architecture.md
+├── .github/workflows/ci.yml
 ├── requirements.txt
+├── requirements-dev.txt
+├── pyproject.toml
+├── .flake8
+├── LICENSE                          # MIT
 └── README.md
 ```
 
-## 🚀 Quick Start
+---
 
-### Prerequisites
+## Quick start
 
-- Python 3.9+
-- Docker & Docker Compose
-- Java 11+ (for Spark)
-- AWS CLI (optional, for cloud deployment)
-
-### Local Development
+### Run the unit tests
 
 ```bash
-# Clone repository
-git clone https://github.com/baanu007/realtime-streaming-pipeline.git
-cd realtime-streaming-pipeline
-
-# Start Kafka cluster
-docker-compose up -d
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Create Kafka topics
-python scripts/create_topics.py
-
-# Start a producer (in terminal 1)
-python src/producers/order_producer.py
-
-# Start a consumer (in terminal 2)
-python src/consumers/order_processor.py
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements-dev.txt
+pytest -v
 ```
 
-## 📊 Stream Processing Jobs
-
-### 1. Order Enrichment
-Joins streaming orders with customer and product dimensions:
-
-```python
-# Enriched order stream with customer and product details
-enriched_orders = (
-    orders_stream
-    .join(customers_df, "customer_id")
-    .join(products_df, "product_id")
-    .withColumn("order_value", col("quantity") * col("unit_price"))
-    .withColumn("processing_time", current_timestamp())
-)
-```
-
-### 2. Real-Time Inventory
-Maintains running inventory counts with windowed aggregations:
-
-```python
-# 5-minute tumbling windows for inventory snapshots
-inventory_updates = (
-    inventory_stream
-    .withWatermark("event_time", "1 minute")
-    .groupBy(
-        window("event_time", "5 minutes"),
-        "product_id",
-        "warehouse_id"
-    )
-    .agg(
-        sum("quantity_change").alias("net_change"),
-        count("*").alias("transaction_count")
-    )
-)
-```
-
-### 3. Fraud Detection
-Real-time ML scoring for suspicious orders:
-
-```python
-# Score each order against fraud model
-fraud_scored = orders_stream.transform(
-    lambda df: apply_fraud_model(df, model_path)
-).filter(col("fraud_score") > 0.8)
-```
-
-## 🔧 Configuration
-
-```yaml
-# config/application.yaml
-kafka:
-  bootstrap_servers: "localhost:9092"
-  consumer_group: "streaming-pipeline"
-  topics:
-    orders: "ecom.orders.v1"
-    inventory: "ecom.inventory.v1"
-    
-spark:
-  master: "local[*]"
-  app_name: "RealTimeStreamingPipeline"
-  checkpoint_location: "s3://bucket/checkpoints/"
-  
-sinks:
-  snowflake:
-    account: "${SNOWFLAKE_ACCOUNT}"
-    warehouse: "STREAMING_WH"
-    database: "REALTIME"
-  redis:
-    host: "localhost"
-    port: 6379
-```
-
-## 📈 Monitoring
-
-- **Kafka**: Confluent Control Center / Kafka Manager
-- **Spark**: Spark UI (port 4040)
-- **Metrics**: Prometheus + Grafana dashboards
-- **Alerting**: CloudWatch / PagerDuty integration
-
-## 🧪 Testing
+### Run the simulator locally (against a real Kinesis stream)
 
 ```bash
-# Unit tests
-pytest tests/unit/ -v
-
-# Integration tests (requires running Kafka)
-pytest tests/integration/ -v
-
-# Load testing
-python scripts/load_test.py --events-per-sec 10000 --duration 60
+export AWS_PROFILE=streaming-dev
+python -m src.producers.event_simulator \
+    --stream-name streamingpipe-dev-events \
+    --rate 200 \
+    --duration 60
 ```
 
-## 🛠️ Technologies
+### Deploy the AWS side
 
-| Component | Technology |
-|-----------|------------|
-| Message Broker | Apache Kafka |
-| Stream Processing | PySpark Structured Streaming |
-| Serialization | Apache Avro / JSON |
-| Cache | Redis |
-| Data Warehouse | Snowflake |
-| Orchestration | Kubernetes |
-| Infrastructure | Terraform / AWS |
-| Monitoring | Prometheus + Grafana |
+```bash
+cd infrastructure/terraform
+terraform init
+terraform apply \
+  -var "events_bucket_arn=arn:aws:s3:::REPLACE-ME-events-bucket" \
+  -var "stream_processor_package_path=../../build/stream_processor.zip"
+```
 
-## 📄 License
+Build the Lambda package however your CI prefers (zip up `src/` plus
+`requirements.txt` deps into `build/stream_processor.zip`).
 
-MIT License
+### Set up the Snowflake side
+
+Run the SQL files in order:
+
+```sql
+!source snowflake/ddl/raw_events_table.sql
+!source snowflake/ddl/staging_external_table.sql
+!source snowflake/ddl/snowpipe.sql            -- then subscribe the SQS ARN
+!source snowflake/ddl/curated_events.sql
+!source snowflake/ddl/streams_tasks.sql
+!source snowflake/procedures/handle_late_events.sql
+```
+
+After `CREATE PIPE`, run `DESCRIBE PIPE STREAMING_DB.RAW.EVENTS_PIPE;` and
+subscribe the returned SQS ARN to the SNS topic on the events S3 bucket.
 
 ---
 
-*Built for high-throughput, low-latency data engineering*
+## Configuration
+
+The stream processor Lambda reads its configuration from environment
+variables wired up by Terraform:
+
+| Variable                   | Required | Description                                       |
+|----------------------------|----------|---------------------------------------------------|
+| `FIREHOSE_DELIVERY_STREAM` | yes      | Name of the Firehose delivery stream.             |
+| `SNS_ALERT_TOPIC_ARN`      | yes      | SNS topic for high-value / fraud alerts.          |
+| `ENRICHMENT_TABLE`         | no       | DynamoDB table with user metadata.                |
+| `HIGH_VALUE_THRESHOLD`     | no       | Dollar threshold for order alerts (default 1000). |
+| `LOG_LEVEL`                | no       | Standard Python log level.                        |
+
+---
+
+## Testing
+
+- **`tests/test_event_simulator.py`** — schema, record building, chunking,
+  retry-on-partial-failure, and a duration-bounded smoke test using a stub
+  Kinesis client.
+- **`tests/test_stream_processor.py`** — decode → enrich → route logic,
+  partial-batch failures via `batchItemFailures`, env-var validation,
+  high-value / fraud routing.
+- **`tests/test_dlq_processor.py`** — verifies S3 partitioning and the
+  envelope shape archived to the dead-letter bucket.
+
+CI runs `flake8`, `black --check`, and `pytest` on Python 3.10 and 3.11.
+
+---
+
+## Operational notes
+
+- **Latency target**: ~3–5 minutes producer → `CURATED.EVENTS`.
+- **Backpressure**: Kinesis ON_DEMAND mode by default; switch to PROVISIONED
+  for predictable cost when throughput stabilises.
+- **Idempotency**: the Snowflake merge keys on `event_id`, so the same record
+  appearing in both Snowpipe and the late-event reconciliation path is safe.
+- **Security**: KMS encryption on Kinesis and SNS; least-privilege IAM per
+  module; no account IDs, real bucket names, or credentials in source.
+
+---
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).

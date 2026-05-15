@@ -1,0 +1,78 @@
+{
+  "_comment": "Reference configuration for the Firehose delivery stream that lands stream-processor output in S3 for Snowpipe. Account IDs, ARNs, and bucket names are placeholders -- substitute via Terraform variables before deploying.",
+  "DeliveryStreamName": "streaming-events-firehose",
+  "DeliveryStreamType": "DirectPut",
+  "ExtendedS3DestinationConfiguration": {
+    "RoleARN": "arn:aws:iam::<ACCOUNT_ID>:role/<FIREHOSE_DELIVERY_ROLE>",
+    "BucketARN": "arn:aws:s3:::<EVENTS_LANDING_BUCKET>",
+    "Prefix": "events/!{partitionKeyFromQuery:event_type}/dt=!{timestamp:yyyy-MM-dd}/hh=!{timestamp:HH}/",
+    "ErrorOutputPrefix": "errors/!{firehose:error-output-type}/dt=!{timestamp:yyyy-MM-dd}/hh=!{timestamp:HH}/",
+    "BufferingHints": {
+      "SizeInMBs": 64,
+      "IntervalInSeconds": 60
+    },
+    "CompressionFormat": "UNCOMPRESSED",
+    "DynamicPartitioningConfiguration": {
+      "Enabled": true,
+      "RetryOptions": {
+        "DurationInSeconds": 300
+      }
+    },
+    "ProcessingConfiguration": {
+      "Enabled": true,
+      "Processors": [
+        {
+          "Type": "MetadataExtraction",
+          "Parameters": [
+            {
+              "ParameterName": "MetadataExtractionQuery",
+              "ParameterValue": "{event_type: .event_type}"
+            },
+            {
+              "ParameterName": "JsonParsingEngine",
+              "ParameterValue": "JQ-1.6"
+            }
+          ]
+        },
+        {
+          "Type": "AppendDelimiterToRecord",
+          "Parameters": [
+            {
+              "ParameterName": "Delimiter",
+              "ParameterValue": "\\n"
+            }
+          ]
+        }
+      ]
+    },
+    "DataFormatConversionConfiguration": {
+      "Enabled": true,
+      "InputFormatConfiguration": {
+        "Deserializer": {
+          "OpenXJsonSerDe": {
+            "CaseInsensitive": true
+          }
+        }
+      },
+      "OutputFormatConfiguration": {
+        "Serializer": {
+          "ParquetSerDe": {
+            "Compression": "SNAPPY"
+          }
+        }
+      },
+      "SchemaConfiguration": {
+        "RoleARN": "arn:aws:iam::<ACCOUNT_ID>:role/<FIREHOSE_DELIVERY_ROLE>",
+        "DatabaseName": "<GLUE_DATABASE>",
+        "TableName": "raw_events",
+        "Region": "<AWS_REGION>",
+        "VersionId": "LATEST"
+      }
+    },
+    "CloudWatchLoggingOptions": {
+      "Enabled": true,
+      "LogGroupName": "/aws/kinesisfirehose/streaming-events-firehose",
+      "LogStreamName": "S3Delivery"
+    }
+  }
+}
