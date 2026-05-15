@@ -56,9 +56,9 @@ class _ScriptedFirehose:
         if not self.script:
             raise AssertionError("_ScriptedFirehose script exhausted")
         plan = self.script.pop(0)
-        assert len(plan) == len(Records), (
-            f"script entry has {len(plan)} outcomes but call had {len(Records)} records"
-        )
+        assert len(plan) == len(
+            Records
+        ), f"script entry has {len(plan)} outcomes but call had {len(Records)} records"
         responses = []
         failed = 0
         for i, ok in enumerate(plan):
@@ -264,9 +264,7 @@ def test_send_to_firehose_retries_failed_records_no_silent_drop(monkeypatch):
         ]
     )
 
-    delivered, failed = stream_handler.send_to_firehose(
-        events, "test-firehose", client=firehose
-    )
+    delivered, failed = stream_handler.send_to_firehose(events, "test-firehose", client=firehose)
 
     assert delivered == 5, "all records must be delivered after retry"
     assert failed == [], "no records should be reported as silently dropped"
@@ -285,15 +283,13 @@ def test_send_to_firehose_exhausts_retries_and_surfaces_unrecovered(monkeypatch)
     firehose = _ScriptedFirehose(
         [
             [False, False],  # initial call
-            [False, True],   # retry 1 (both still pending)
-            [False],         # retry 2 (only record 0 still pending)
-            [False],         # retry 3 (final)
+            [False, True],  # retry 1 (both still pending)
+            [False],  # retry 2 (only record 0 still pending)
+            [False],  # retry 3 (final)
         ]
     )
 
-    delivered, failed = stream_handler.send_to_firehose(
-        events, "test-firehose", client=firehose
-    )
+    delivered, failed = stream_handler.send_to_firehose(events, "test-firehose", client=firehose)
 
     # 1 record succeeded; 1 unrecovered should be surfaced (not silently dropped).
     assert delivered == 1
@@ -321,16 +317,14 @@ def test_handler_surfaces_firehose_failures_as_batch_item_failures(
     firehose = _ScriptedFirehose(
         [
             [True, False, True],  # initial
-            [False],              # retry 1
-            [False],              # retry 2
-            [False],              # retry 3
+            [False],  # retry 1
+            [False],  # retry 2
+            [False],  # retry 3
         ]
     )
     sns = _FakeSNS()
 
-    result = stream_handler.process_event(
-        event, firehose_client=firehose, sns_client=sns
-    )
+    result = stream_handler.process_event(event, firehose_client=firehose, sns_client=sns)
 
     assert result["metrics"]["delivered"] == 2
     assert result["metrics"]["firehose_failed"] == 1
@@ -349,14 +343,12 @@ def test_handler_retry_then_success_reports_no_failures(
     firehose = _ScriptedFirehose(
         [
             [False, False, True, True],  # 2 fail
-            [True, True],                 # both succeed on retry
+            [True, True],  # both succeed on retry
         ]
     )
     sns = _FakeSNS()
 
-    result = stream_handler.process_event(
-        event, firehose_client=firehose, sns_client=sns
-    )
+    result = stream_handler.process_event(event, firehose_client=firehose, sns_client=sns)
 
     assert result["metrics"]["delivered"] == 4
     assert result["metrics"]["firehose_failed"] == 0

@@ -204,9 +204,7 @@ def _flush_firehose(
 
     for attempt in range(FIREHOSE_MAX_RETRIES + 1):
         try:
-            resp = client.put_record_batch(
-                DeliveryStreamName=stream_name, Records=pending
-            )
+            resp = client.put_record_batch(DeliveryStreamName=stream_name, Records=pending)
         except ClientError as exc:
             logger.error("Firehose PutRecordBatch failed: %s", exc)
             raise
@@ -246,9 +244,7 @@ def _flush_firehose(
                 len(responses),
                 len(pending),
             )
-            for rec, event in zip(
-                pending[len(responses):], pending_events[len(responses):]
-            ):
+            for rec, event in zip(pending[len(responses) :], pending_events[len(responses) :]):
                 next_pending.append(rec)
                 next_pending_events.append(event)
                 next_errors.append({"ErrorCode": "ResponseLengthMismatch"})
@@ -270,15 +266,13 @@ def _flush_firehose(
             return delivered_total, []
 
         if attempt < FIREHOSE_MAX_RETRIES:
-            time.sleep(FIREHOSE_RETRY_BASE_DELAY * (2 ** attempt))
+            time.sleep(FIREHOSE_RETRY_BASE_DELAY * (2**attempt))
 
     # Exhausted retries; log a trimmed body for each unrecovered record.
     for rec, event, err in zip(pending, pending_events, last_errors):
         body = rec.get("Data", b"")
         try:
-            preview = body[:FIREHOSE_FAILED_RECORD_LOG_LIMIT].decode(
-                "utf-8", errors="replace"
-            )
+            preview = body[:FIREHOSE_FAILED_RECORD_LOG_LIMIT].decode("utf-8", errors="replace")
         except Exception:  # pragma: no cover - defensive
             preview = "<unprintable>"
         logger.error(
