@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest>=7.4.0
+pytest-cov>=4.1.0
+moto[kinesis,sns,sqs,s3,dynamodb]>=5.0.0
+flake8>=6.1.0
+black>=24.0.0
