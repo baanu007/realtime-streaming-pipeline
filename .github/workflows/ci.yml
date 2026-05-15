@@ -1,10 +1,9 @@
 name: CI
 
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+# Trigger CI on every push and every pull_request, regardless of branch. This
+# ensures feature branches (e.g. clawdbot/flesh-out-*) get build feedback and
+# PRs from forks/branches actually run the workflow.
+on: [push, pull_request]
 
 jobs:
   test:
