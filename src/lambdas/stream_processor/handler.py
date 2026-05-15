@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
@@ -45,6 +46,14 @@ FIREHOSE_BATCH_LIMIT = 500
 FIREHOSE_PAYLOAD_LIMIT = 4 * 1024 * 1024  # PutRecordBatch limit
 DEFAULT_HIGH_VALUE_THRESHOLD = 1000.0
 FRAUD_SIGNALS = {"fraud_suspected", "card_velocity_high", "geo_mismatch"}
+
+# Firehose per-record retry policy. Real data-loss bug fix: PutRecordBatch can
+# return ``FailedPutCount > 0`` while the overall HTTP call succeeds; the failed
+# entries are identified by ``ErrorCode`` in ``RequestResponses`` and *must* be
+# retried (or surfaced to the caller) or the records are silently dropped.
+FIREHOSE_MAX_RETRIES = 3
+FIREHOSE_RETRY_BASE_DELAY = 0.5  # seconds; doubled each attempt
+FIREHOSE_FAILED_RECORD_LOG_LIMIT = 512  # bytes of record body to keep in logs
 
 
 # ----------------------------------------------------------------------
@@ -135,7 +144,13 @@ def send_to_firehose(
     stream_name: str,
     client: Any = None,
 ) -> int:
-    """Send events to Firehose. Returns count of successfully delivered events."""
+    """Send events to Firehose. Returns count of successfully delivered events.
+
+    Per-record failures inside ``PutRecordBatch`` responses are retried with
+    exponential backoff up to ``FIREHOSE_MAX_RETRIES`` times. Records that
+    never succeed are logged (body trimmed) and counted as not delivered, so
+    callers can detect a deficit instead of seeing a silent data loss.
+    """
     if not events:
         return 0
     fh = client or _firehose_client()
@@ -158,16 +173,104 @@ def send_to_firehose(
     return delivered
 
 
-def _flush_firehose(client: Any, stream_name: str, batch: List[Dict[str, Any]]) -> int:
-    try:
-        resp = client.put_record_batch(DeliveryStreamName=stream_name, Records=batch)
-    except ClientError as exc:
-        logger.error("Firehose PutRecordBatch failed: %s", exc)
-        raise
-    failed = int(resp.get("FailedPutCount", 0) or 0)
-    if failed:
-        logger.warning("Firehose reported %s failed records", failed)
-    return len(batch) - failed
+def _flush_firehose(
+    client: Any, stream_name: str, batch: List[Dict[str, Any]]
+) -> int:
+    """PutRecordBatch with per-record exponential-backoff retry.
+
+    Returns the count of records that were successfully delivered. Records
+    whose response entry contains ``ErrorCode`` are retried up to
+    ``FIREHOSE_MAX_RETRIES`` times with exponential backoff
+    (``FIREHOSE_RETRY_BASE_DELAY``, doubled each attempt). Any still-failing
+    records have a truncated copy of their body logged for forensics; they are
+    *not* counted as delivered, so the caller can detect the deficit.
+    """
+    pending = list(batch)
+    initial_count = len(pending)
+    delivered_total = 0
+    last_errors: List[Dict[str, Any]] = [{} for _ in pending]
+
+    for attempt in range(FIREHOSE_MAX_RETRIES + 1):
+        try:
+            resp = client.put_record_batch(
+                DeliveryStreamName=stream_name, Records=pending
+            )
+        except ClientError as exc:
+            logger.error("Firehose PutRecordBatch failed: %s", exc)
+            raise
+
+        responses = resp.get("RequestResponses", []) or []
+        failed_count = int(resp.get("FailedPutCount", 0) or 0)
+
+        if not failed_count:
+            delivered_total += len(pending)
+            return delivered_total
+
+        # Identify failed entries by presence of ErrorCode (Firehose contract).
+        next_pending: List[Dict[str, Any]] = []
+        next_errors: List[Dict[str, Any]] = []
+        succeeded_this_round = 0
+        for rec, response_entry in zip(pending, responses):
+            if response_entry.get("ErrorCode"):
+                next_pending.append(rec)
+                next_errors.append(
+                    {
+                        "ErrorCode": response_entry.get("ErrorCode"),
+                        "ErrorMessage": response_entry.get("ErrorMessage"),
+                    }
+                )
+            else:
+                succeeded_this_round += 1
+        delivered_total += succeeded_this_round
+
+        # Defensive: if RequestResponses length didn't match pending, treat any
+        # remainder as failed so we don't accidentally count records as ok.
+        if len(responses) != len(pending):
+            logger.error(
+                "Firehose RequestResponses length mismatch: %s vs %s; "
+                "treating remainder as failed",
+                len(responses),
+                len(pending),
+            )
+            for rec in pending[len(responses):]:
+                next_pending.append(rec)
+                next_errors.append({"ErrorCode": "ResponseLengthMismatch"})
+
+        logger.warning(
+            "Firehose attempt %s/%s: %s/%s records failed; will %s",
+            attempt + 1,
+            FIREHOSE_MAX_RETRIES + 1,
+            len(next_pending),
+            initial_count,
+            "retry" if attempt < FIREHOSE_MAX_RETRIES else "surface to caller",
+        )
+
+        pending = next_pending
+        last_errors = next_errors
+
+        if not pending:
+            return delivered_total
+
+        if attempt < FIREHOSE_MAX_RETRIES:
+            time.sleep(FIREHOSE_RETRY_BASE_DELAY * (2 ** attempt))
+
+    # Exhausted retries; log a trimmed body for each unrecovered record.
+    for rec, err in zip(pending, last_errors):
+        body = rec.get("Data", b"")
+        try:
+            preview = body[:FIREHOSE_FAILED_RECORD_LOG_LIMIT].decode(
+                "utf-8", errors="replace"
+            )
+        except Exception:  # pragma: no cover - defensive
+            preview = "<unprintable>"
+        logger.error(
+            "Firehose record unrecovered after %s attempts: error=%s msg=%s body=%s",
+            FIREHOSE_MAX_RETRIES + 1,
+            err.get("ErrorCode"),
+            err.get("ErrorMessage"),
+            preview,
+        )
+    return delivered_total
 
 
 def send_alerts(

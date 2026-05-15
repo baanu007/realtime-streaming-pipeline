@@ -21,10 +21,58 @@ class _FakeFirehose:
 
     def put_record_batch(self, *, DeliveryStreamName, Records):  # noqa: N803
         self.calls.append({"stream": DeliveryStreamName, "records": list(Records)})
+        responses = []
+        for i in range(len(Records)):
+            if i < self._failed_count:
+                responses.append(
+                    {
+                        "ErrorCode": "ServiceUnavailableException",
+                        "ErrorMessage": "throttled",
+                    }
+                )
+            else:
+                responses.append({"RecordId": f"r-{i}"})
         return {
             "FailedPutCount": self._failed_count,
-            "RequestResponses": [{"RecordId": f"r-{i}"} for i in range(len(Records))],
+            "RequestResponses": responses,
         }
+
+
+class _ScriptedFirehose:
+    """Firehose fake whose responses follow a scripted sequence.
+
+    Each script entry is a list with one boolean per record in the call:
+    ``True`` = succeed, ``False`` = fail with a retryable ErrorCode. The fake
+    only sees the *currently pending* records on each retry attempt, so the
+    script reflects what Firehose would return on each successive call.
+    """
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls: List[Dict[str, Any]] = []
+
+    def put_record_batch(self, *, DeliveryStreamName, Records):  # noqa: N803
+        self.calls.append({"stream": DeliveryStreamName, "records": list(Records)})
+        if not self.script:
+            raise AssertionError("_ScriptedFirehose script exhausted")
+        plan = self.script.pop(0)
+        assert len(plan) == len(Records), (
+            f"script entry has {len(plan)} outcomes but call had {len(Records)} records"
+        )
+        responses = []
+        failed = 0
+        for i, ok in enumerate(plan):
+            if ok:
+                responses.append({"RecordId": f"r-{i}"})
+            else:
+                failed += 1
+                responses.append(
+                    {
+                        "ErrorCode": "ServiceUnavailableException",
+                        "ErrorMessage": "throttled",
+                    }
+                )
+        return {"FailedPutCount": failed, "RequestResponses": responses}
 
 
 class _FakeSNS:
@@ -186,3 +234,61 @@ def test_handler_handles_empty_batch(env_setup):
     assert result["metrics"] == {"processed": 0, "delivered": 0, "alerts": 0, "failed": 0}
     assert firehose.calls == []
     assert sns.published == []
+
+
+# ---------------------------------------------------------------------------
+# Firehose retry behaviour (real data-loss bug fix)
+# ---------------------------------------------------------------------------
+def test_send_to_firehose_retries_failed_records_no_silent_drop(monkeypatch):
+    """Firehose returns FailedPutCount=2 then everything succeeds on retry.
+
+    The function must retry the failed records (not silently drop them) and
+    report ``delivered == len(events)``.
+    """
+    # Speed up the test - no real sleeping.
+    monkeypatch.setattr(stream_handler.time, "sleep", lambda *_a, **_k: None)
+
+    events = [{"event_id": f"e{i}", "event_type": "page_view"} for i in range(5)]
+    # First call: records 0 and 1 fail, 2-4 succeed.
+    # Second call (retry of just records 0 and 1): both succeed.
+    firehose = _ScriptedFirehose(
+        [
+            [False, False, True, True, True],
+            [True, True],
+        ]
+    )
+
+    delivered = stream_handler.send_to_firehose(
+        events, "test-firehose", client=firehose
+    )
+
+    assert delivered == 5, "all records must be delivered after retry"
+    assert len(firehose.calls) == 2, "retry should have produced a second call"
+    # First call had all 5; second call should only contain the 2 that failed.
+    assert len(firehose.calls[0]["records"]) == 5
+    assert len(firehose.calls[1]["records"]) == 2
+
+
+def test_send_to_firehose_exhausts_retries_and_reports_deficit(monkeypatch):
+    """After exhausting retries, unrecovered records must not be counted as delivered."""
+    monkeypatch.setattr(stream_handler.time, "sleep", lambda *_a, **_k: None)
+
+    events = [{"event_id": "a"}, {"event_id": "b"}]
+    # Every attempt fails record 0; record 1 fails first call then succeeds.
+    firehose = _ScriptedFirehose(
+        [
+            [False, False],  # initial call
+            [False, True],   # retry 1 (both still pending)
+            [False],         # retry 2 (only record 0 still pending)
+            [False],         # retry 3 (final)
+        ]
+    )
+
+    delivered = stream_handler.send_to_firehose(
+        events, "test-firehose", client=firehose
+    )
+
+    # 1 record succeeded; 1 unrecovered should NOT be counted as delivered.
+    assert delivered == 1
+    # 1 initial + 3 retries.
+    assert len(firehose.calls) == 1 + stream_handler.FIREHOSE_MAX_RETRIES
