@@ -28,7 +28,7 @@ import logging
 import os
 import time
 from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import boto3
@@ -143,19 +143,22 @@ def send_to_firehose(
     events: List[Dict[str, Any]],
     stream_name: str,
     client: Any = None,
-) -> int:
-    """Send events to Firehose. Returns count of successfully delivered events.
+) -> Tuple[int, List[Dict[str, Any]]]:
+    """Send events to Firehose.
 
-    Per-record failures inside ``PutRecordBatch`` responses are retried with
-    exponential backoff up to ``FIREHOSE_MAX_RETRIES`` times. Records that
-    never succeed are logged (body trimmed) and counted as not delivered, so
-    callers can detect a deficit instead of seeing a silent data loss.
+    Returns ``(delivered, failed_events)`` where ``failed_events`` is the list
+    of original event dicts that Firehose could not accept even after retries.
+    Callers are expected to surface ``failed_events`` to their batch source
+    (e.g. Kinesis ``batchItemFailures``) so the records are retried rather than
+    silently dropped.
     """
     if not events:
-        return 0
+        return 0, []
     fh = client or _firehose_client()
     delivered = 0
+    failed_events: List[Dict[str, Any]] = []
     batch: List[Dict[str, Any]] = []
+    batch_events: List[Dict[str, Any]] = []
     batch_bytes = 0
     for event in events:
         rec = {"Data": (json.dumps(event, separators=(",", ":")) + "\n").encode("utf-8")}
@@ -163,29 +166,38 @@ def send_to_firehose(
         if batch and (
             len(batch) >= FIREHOSE_BATCH_LIMIT or batch_bytes + size > FIREHOSE_PAYLOAD_LIMIT
         ):
-            delivered += _flush_firehose(fh, stream_name, batch)
+            ok, bad = _flush_firehose(fh, stream_name, batch, batch_events)
+            delivered += ok
+            failed_events.extend(bad)
             batch = []
+            batch_events = []
             batch_bytes = 0
         batch.append(rec)
+        batch_events.append(event)
         batch_bytes += size
     if batch:
-        delivered += _flush_firehose(fh, stream_name, batch)
-    return delivered
+        ok, bad = _flush_firehose(fh, stream_name, batch, batch_events)
+        delivered += ok
+        failed_events.extend(bad)
+    return delivered, failed_events
 
 
 def _flush_firehose(
-    client: Any, stream_name: str, batch: List[Dict[str, Any]]
-) -> int:
+    client: Any,
+    stream_name: str,
+    batch: List[Dict[str, Any]],
+    batch_events: List[Dict[str, Any]],
+) -> Tuple[int, List[Dict[str, Any]]]:
     """PutRecordBatch with per-record exponential-backoff retry.
 
-    Returns the count of records that were successfully delivered. Records
-    whose response entry contains ``ErrorCode`` are retried up to
-    ``FIREHOSE_MAX_RETRIES`` times with exponential backoff
-    (``FIREHOSE_RETRY_BASE_DELAY``, doubled each attempt). Any still-failing
-    records have a truncated copy of their body logged for forensics; they are
-    *not* counted as delivered, so the caller can detect the deficit.
+    Returns ``(delivered_count, unrecovered_events)``. Records whose response
+    entry contains ``ErrorCode`` are retried up to ``FIREHOSE_MAX_RETRIES``
+    times with exponential backoff (``FIREHOSE_RETRY_BASE_DELAY``, doubled
+    each attempt). Any still-failing records are returned to the caller; a
+    truncated copy of each failed body is logged for forensics.
     """
     pending = list(batch)
+    pending_events = list(batch_events)
     initial_count = len(pending)
     delivered_total = 0
     last_errors: List[Dict[str, Any]] = [{} for _ in pending]
@@ -204,15 +216,17 @@ def _flush_firehose(
 
         if not failed_count:
             delivered_total += len(pending)
-            return delivered_total
+            return delivered_total, []
 
         # Identify failed entries by presence of ErrorCode (Firehose contract).
         next_pending: List[Dict[str, Any]] = []
+        next_pending_events: List[Dict[str, Any]] = []
         next_errors: List[Dict[str, Any]] = []
         succeeded_this_round = 0
-        for rec, response_entry in zip(pending, responses):
+        for rec, event, response_entry in zip(pending, pending_events, responses):
             if response_entry.get("ErrorCode"):
                 next_pending.append(rec)
+                next_pending_events.append(event)
                 next_errors.append(
                     {
                         "ErrorCode": response_entry.get("ErrorCode"),
@@ -232,8 +246,11 @@ def _flush_firehose(
                 len(responses),
                 len(pending),
             )
-            for rec in pending[len(responses):]:
+            for rec, event in zip(
+                pending[len(responses):], pending_events[len(responses):]
+            ):
                 next_pending.append(rec)
+                next_pending_events.append(event)
                 next_errors.append({"ErrorCode": "ResponseLengthMismatch"})
 
         logger.warning(
@@ -246,16 +263,17 @@ def _flush_firehose(
         )
 
         pending = next_pending
+        pending_events = next_pending_events
         last_errors = next_errors
 
         if not pending:
-            return delivered_total
+            return delivered_total, []
 
         if attempt < FIREHOSE_MAX_RETRIES:
             time.sleep(FIREHOSE_RETRY_BASE_DELAY * (2 ** attempt))
 
     # Exhausted retries; log a trimmed body for each unrecovered record.
-    for rec, err in zip(pending, last_errors):
+    for rec, event, err in zip(pending, pending_events, last_errors):
         body = rec.get("Data", b"")
         try:
             preview = body[:FIREHOSE_FAILED_RECORD_LOG_LIMIT].decode(
@@ -270,7 +288,7 @@ def _flush_firehose(
             err.get("ErrorMessage"),
             preview,
         )
-    return delivered_total
+    return delivered_total, pending_events
 
 
 def send_alerts(
@@ -325,8 +343,17 @@ def process_event(
     threshold = float(_env("HIGH_VALUE_THRESHOLD", str(DEFAULT_HIGH_VALUE_THRESHOLD)))
 
     valid_events: List[Dict[str, Any]] = []
+    # Parallel list: sequence number tied to each entry of ``valid_events`` so
+    # Firehose-side failures can be surfaced via ``batchItemFailures``.
+    valid_event_seqs: List[str] = []
     alerts: List[Dict[str, Any]] = []
     batch_item_failures: List[Dict[str, str]] = []
+    failed_seq_set: set = set()
+
+    def _record_failure(seq: Optional[str]) -> None:
+        if seq and seq not in failed_seq_set:
+            failed_seq_set.add(seq)
+            batch_item_failures.append({"itemIdentifier": seq})
 
     for rec in decode_records(event):
         if isinstance(rec, FailedRecord):
@@ -335,8 +362,7 @@ def process_event(
                 rec.sequence_number,
                 rec.reason,
             )
-            if rec.sequence_number:
-                batch_item_failures.append({"itemIdentifier": rec.sequence_number})
+            _record_failure(rec.sequence_number)
             continue
 
         assert isinstance(rec, DecodedRecord)
@@ -344,28 +370,42 @@ def process_event(
             enriched = enrich(rec.payload, enrichment_table)
         except Exception:  # noqa: BLE001 - never poison the whole batch
             logger.exception("Enrichment failure for seq=%s", rec.sequence_number)
-            batch_item_failures.append({"itemIdentifier": rec.sequence_number})
+            _record_failure(rec.sequence_number)
             continue
 
         valid_events.append(enriched)
+        valid_event_seqs.append(rec.sequence_number)
         if is_high_value_order(enriched, threshold) or is_fraud_signal(enriched):
             alerts.append(enriched)
 
     delivered = 0
+    firehose_failed_events: List[Dict[str, Any]] = []
     try:
-        delivered = send_to_firehose(valid_events, firehose_stream, client=firehose_client)
+        delivered, firehose_failed_events = send_to_firehose(
+            valid_events, firehose_stream, client=firehose_client
+        )
     except ClientError:
         # Re-raise so Lambda retries the whole batch on infrastructure errors.
         raise
 
+    # Surface unrecovered Firehose failures via Kinesis batchItemFailures so the
+    # records get retried rather than silently dropped. We map by identity
+    # since enrich() returns a fresh dict per event.
+    if firehose_failed_events:
+        failed_ids = {id(e) for e in firehose_failed_events}
+        for ev, seq in zip(valid_events, valid_event_seqs):
+            if id(ev) in failed_ids:
+                _record_failure(seq)
+
     published = send_alerts(alerts, sns_topic, client=sns_client)
 
     logger.info(
-        "processed=%s delivered=%s alerts=%s failed=%s",
+        "processed=%s delivered=%s alerts=%s failed=%s firehose_failed=%s",
         len(valid_events),
         delivered,
         published,
         len(batch_item_failures),
+        len(firehose_failed_events),
     )
     return {
         "batchItemFailures": batch_item_failures,
@@ -374,6 +414,7 @@ def process_event(
             "delivered": delivered,
             "alerts": published,
             "failed": len(batch_item_failures),
+            "firehose_failed": len(firehose_failed_events),
         },
     }
 

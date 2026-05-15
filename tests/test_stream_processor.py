@@ -231,7 +231,13 @@ def test_handler_handles_empty_batch(env_setup):
     firehose = _FakeFirehose()
     sns = _FakeSNS()
     result = stream_handler.process_event({"Records": []}, firehose_client=firehose, sns_client=sns)
-    assert result["metrics"] == {"processed": 0, "delivered": 0, "alerts": 0, "failed": 0}
+    assert result["metrics"] == {
+        "processed": 0,
+        "delivered": 0,
+        "alerts": 0,
+        "failed": 0,
+        "firehose_failed": 0,
+    }
     assert firehose.calls == []
     assert sns.published == []
 
@@ -258,19 +264,20 @@ def test_send_to_firehose_retries_failed_records_no_silent_drop(monkeypatch):
         ]
     )
 
-    delivered = stream_handler.send_to_firehose(
+    delivered, failed = stream_handler.send_to_firehose(
         events, "test-firehose", client=firehose
     )
 
     assert delivered == 5, "all records must be delivered after retry"
+    assert failed == [], "no records should be reported as silently dropped"
     assert len(firehose.calls) == 2, "retry should have produced a second call"
     # First call had all 5; second call should only contain the 2 that failed.
     assert len(firehose.calls[0]["records"]) == 5
     assert len(firehose.calls[1]["records"]) == 2
 
 
-def test_send_to_firehose_exhausts_retries_and_reports_deficit(monkeypatch):
-    """After exhausting retries, unrecovered records must not be counted as delivered."""
+def test_send_to_firehose_exhausts_retries_and_surfaces_unrecovered(monkeypatch):
+    """After exhausting retries, unrecovered records must be returned to caller."""
     monkeypatch.setattr(stream_handler.time, "sleep", lambda *_a, **_k: None)
 
     events = [{"event_id": "a"}, {"event_id": "b"}]
@@ -284,11 +291,73 @@ def test_send_to_firehose_exhausts_retries_and_reports_deficit(monkeypatch):
         ]
     )
 
-    delivered = stream_handler.send_to_firehose(
+    delivered, failed = stream_handler.send_to_firehose(
         events, "test-firehose", client=firehose
     )
 
-    # 1 record succeeded; 1 unrecovered should NOT be counted as delivered.
+    # 1 record succeeded; 1 unrecovered should be surfaced (not silently dropped).
     assert delivered == 1
+    assert failed == [{"event_id": "a"}], "unrecovered record must be surfaced"
     # 1 initial + 3 retries.
     assert len(firehose.calls) == 1 + stream_handler.FIREHOSE_MAX_RETRIES
+
+
+# ---------------------------------------------------------------------------
+# Handler-level: Firehose failures surfaced as Kinesis batchItemFailures
+# ---------------------------------------------------------------------------
+def test_handler_surfaces_firehose_failures_as_batch_item_failures(
+    env_setup, monkeypatch, kinesis_event_factory
+):
+    """End-to-end: unrecoverable Firehose failures land in batchItemFailures."""
+    monkeypatch.setattr(stream_handler.time, "sleep", lambda *_a, **_k: None)
+
+    payloads = [
+        {"event_id": "e0", "event_type": "page_view"},
+        {"event_id": "e1", "event_type": "page_view"},
+        {"event_id": "e2", "event_type": "page_view"},
+    ]
+    event = kinesis_event_factory(payloads)
+    # Record 1 fails on every attempt; 0 and 2 always succeed.
+    firehose = _ScriptedFirehose(
+        [
+            [True, False, True],  # initial
+            [False],              # retry 1
+            [False],              # retry 2
+            [False],              # retry 3
+        ]
+    )
+    sns = _FakeSNS()
+
+    result = stream_handler.process_event(
+        event, firehose_client=firehose, sns_client=sns
+    )
+
+    assert result["metrics"]["delivered"] == 2
+    assert result["metrics"]["firehose_failed"] == 1
+    # seq-1 corresponds to the second payload (kinesis_event_factory uses seq-i).
+    assert {"itemIdentifier": "seq-1"} in result["batchItemFailures"]
+
+
+def test_handler_retry_then_success_reports_no_failures(
+    env_setup, monkeypatch, kinesis_event_factory
+):
+    """FailedPutCount=2 then success on retry => no records silently dropped."""
+    monkeypatch.setattr(stream_handler.time, "sleep", lambda *_a, **_k: None)
+
+    payloads = [{"event_id": f"e{i}", "event_type": "page_view"} for i in range(4)]
+    event = kinesis_event_factory(payloads)
+    firehose = _ScriptedFirehose(
+        [
+            [False, False, True, True],  # 2 fail
+            [True, True],                 # both succeed on retry
+        ]
+    )
+    sns = _FakeSNS()
+
+    result = stream_handler.process_event(
+        event, firehose_client=firehose, sns_client=sns
+    )
+
+    assert result["metrics"]["delivered"] == 4
+    assert result["metrics"]["firehose_failed"] == 0
+    assert result["batchItemFailures"] == []
